@@ -17,9 +17,11 @@ module Network.Http.Connection (
     Connection(..),
         -- constructors only for testing
     makeConnection,
-    withConnection,
+    withConnection,    
     openConnection,
+    openBoundConnection,
     openConnectionSSL,
+    openBoundConnectionSSL,
     closeConnection,
     getHostname,
     getRequestHeaders,
@@ -32,17 +34,20 @@ module Network.Http.Connection (
     fileBody,
     inputStreamBody,
     debugHandler,
-    concatHandler
+    concatHandler,
+    toSockAddrIPv4
 ) where
 
 import Blaze.ByteString.Builder (Builder)
 import qualified Blaze.ByteString.Builder as Builder (flush, fromByteString,
                                                       toByteString)
 import qualified Blaze.ByteString.Builder.HTTP as Builder (chunkedTransferEncoding, chunkedTransferTerminator)
+import Control.Applicative ((<$>))
 import Control.Exception (bracket)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as S
 import Data.Monoid (mappend, mempty)
+import Network.BSD (HostEntry (hostAddresses), getHostByName)
 import Network.Socket
 import OpenSSL (withOpenSSL)
 import OpenSSL.Session (SSL, SSLContext)
@@ -133,7 +138,6 @@ withConnection :: IO Connection -> (Connection -> IO γ) -> IO γ
 withConnection mkC =
     bracket mkC closeConnection
 
-
 --
 -- | In order to make a request you first establish the TCP
 -- connection to the server over which to send it.
@@ -163,11 +167,28 @@ withConnection mkC =
 -- connection for subsequent requests.
 --
 openConnection :: Hostname -> Port -> IO Connection
-openConnection h1' p = do
+openConnection = openBoundConnection Nothing
+
+--
+-- | A version of 'openConnection' where the client connection is
+-- bound to a specific source IP address. For convenience
+-- 'toSockAddrIPv4' can be used to create a SockAddr for the selected
+-- IP.
+--
+-- Usage:
+--
+-- >     sa <- toSockAddrIPv4 "192.168.100.1"
+-- >     c  <- openBoundConnection (Just sa) "localhost" 80
+-- >     ...
+-- >     closeConnection c
+--
+openBoundConnection :: Maybe SockAddr -> Hostname -> Port -> IO Connection
+openBoundConnection b h1' p = do
     is <- getAddrInfo (Just hints) (Just h1) (Just $ show p)
     let addr = head is
     let a = addrAddress addr
     s <- socket (addrFamily addr) Stream defaultProtocol
+    maybeBind s b
 
     connect s a
     (i,o1) <- Streams.socketToStreams s
@@ -221,12 +242,24 @@ openConnection h1' p = do
 -- initialization is invoked once per process for you/
 --
 openConnectionSSL :: SSLContext -> Hostname -> Port -> IO Connection
-openConnectionSSL ctx h1' p = withOpenSSL $ do
+openConnectionSSL = openBoundConnectionSSL Nothing
+
+--
+-- | A version of 'openConnectionSSL' where the client connection is
+-- bound to a specific source IP address. For convenience
+-- 'toSockAddrIPv4' can be used to create a SockAddr for the selected
+-- IP address.
+--
+-- See 'openBoundConnection' for example on usage.
+--
+openBoundConnectionSSL :: Maybe SockAddr -> SSLContext -> Hostname -> Port -> IO Connection
+openBoundConnectionSSL b ctx h1' p = withOpenSSL $ do
     is <- getAddrInfo Nothing (Just h1) (Just $ show p)
 
     let a = addrAddress $ head is
         f = addrFamily $ head is
     s <- socket f Stream defaultProtocol
+    maybeBind s b
 
     connect s a
 
@@ -254,6 +287,13 @@ closeSSL :: Socket -> SSL -> IO ()
 closeSSL s ssl = do
     SSL.shutdown ssl SSL.Unidirectional
     close s
+
+--
+-- | Maybe bind the socket to the supplied socket address.
+--
+maybeBind :: Socket -> Maybe SockAddr -> IO ()
+maybeBind s (Just addr) = bind s addr
+maybeBind _ Nothing     = return ()
 
 --
 -- | Having composed a 'Request' object with the headers and metadata for
@@ -612,3 +652,13 @@ concatHandler _ i1 = do
 --
 closeConnection :: Connection -> IO ()
 closeConnection c = cClose c
+
+--
+-- | Convert from an IPv4 address (on the client's machine) to a
+-- SockAddr data structure. To be used for binding a client connection to a
+-- specific source address.
+--
+toSockAddrIPv4 :: HostName -> IO SockAddr
+toSockAddrIPv4 str =
+  SockAddrInet aNY_PORT <$>
+    head . hostAddresses <$> getHostByName str
